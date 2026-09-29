@@ -1,0 +1,537 @@
+#!/bin/bash
+# openflux-ctl — управление нодой OpenFlux.  Подсказка: openflux-ctl help
+set -u
+
+REPO_DIR="/root/openflux"
+BIN="$REPO_DIR/openflux"
+SECRETS="/root/openflux-secrets"
+KEY_FILE="$SECRETS/encryption-key"
+UNIT_DIR="/etc/systemd/system"
+PREFIX="openflux-"
+FW_UNIT="firewall-openflux.service"
+CRON_FILE="/etc/cron.d/openflux-deploy"
+REPORT="/root/openflux-checklist.txt"
+TRANSPORTS="yandex vyandex boards mailru cupsonline"
+PROBS=0
+WARNS=0
+
+if [ -t 1 ]; then
+    G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; B=$'\033[1m'; N=$'\033[0m'
+else
+    G=""; R=""; Y=""; B=""; N=""
+fi
+
+ok()   { echo "${G}[ OK ]${N} $*"; }
+warn() { WARNS=$((WARNS + 1)); echo "${Y}[ !! ]${N} $*"; }
+bad()  { PROBS=$((PROBS + 1)); echo "${R}[FAIL]${N} $*"; }
+die()  { echo "${R}ОШИБКА:${N} $*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "Запусти от root (команда: sudo -i), потом повтори."; }
+
+confirm() {
+    local a=""
+    read -r -p "$1 [y/N] " a </dev/tty 2>/dev/null || a=""
+    case "$a" in y | Y | yes | да | Да | д | Д) return 0 ;; *) return 1 ;; esac
+}
+
+svc()       { echo "${PREFIX}$1.service"; }
+unit_path() { echo "$UNIT_DIR/${PREFIX}$1.service"; }
+exists()    { [ -f "$(unit_path "$1")" ]; }
+
+all_names() {
+    local f b
+    for f in "$UNIT_DIR/${PREFIX}"*.service; do
+        [ -e "$f" ] || continue
+        b=$(basename "$f" .service)
+        echo "${b#"$PREFIX"}"
+    done
+}
+
+# транспорт одиночной ноды (у session пусто)
+transport_of() {
+    grep -o -- '--transport=[a-z0-9]*' "$(unit_path "$1")" 2>/dev/null | head -1 | cut -d= -f2
+}
+
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+
+human_state() {
+    case "$1" in
+        active) echo "работает" ;;
+        activating) echo "ПЕРЕЗАПУСКАЕТСЯ (ошибка!)" ;;
+        inactive) echo "остановлена" ;;
+        failed) echo "УПАЛА" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# write_unit <имя> <описание> <аргументы бинарника>
+write_unit() {
+    local name="$1" desc="$2" args="$3"
+    cat > "$(unit_path "$name")" <<EOF
+[Unit]
+Description=$desc
+After=network-online.target $FW_UNIT
+Wants=network-online.target $FW_UNIT
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=$REPO_DIR
+ExecStart=/bin/bash -c 'exec $BIN $args'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# ---------------------------------------------------------------- add
+cmd_add() {
+    need_root
+    [ $# -ge 2 ] || die "Использование: openflux-ctl add <транспорт> <ссылка> [имя] [-- доп.флаги]
+   Пример:        openflux-ctl add yandex https://disk.yandex.ru/i/XXXX"
+    local transport="$1" url="$2" name extra=""
+    shift 2
+    name="$transport"
+    if [ $# -gt 0 ] && [ "$1" != "--" ]; then
+        name="$1"
+        shift
+    fi
+    if [ "${1:-}" = "--" ]; then
+        shift
+        extra="$*"
+    fi
+
+    case "$transport" in
+        yandex | vyandex | boards | mailru | cupsonline) ;;
+        oneme) die "Транспорт oneme требует токен и в этой команде не поддерживается (см. README, «Продвинутое»)." ;;
+        *) die "Неизвестный транспорт '$transport'. Доступны: $TRANSPORTS" ;;
+    esac
+    valid_name "$name" || die "Имя '$name' не подходит: только маленькие латинские буквы, цифры и дефис."
+    [ "$name" != "session" ] || die "Имя 'session' зарезервировано. Для него есть команда: openflux-ctl session"
+    exists "$name" && die "Нода '$name' уже есть. Сменить ссылку: openflux-ctl set-url $name <ссылка>. Удалить: openflux-ctl remove $name"
+    [ -x "$BIN" ] || die "Не найден бинарник $BIN. Сначала запусти установщик (setup.sh) или: openflux-ctl deploy --force"
+    [ -s "$KEY_FILE" ] || die "Нет ключа шифрования ($KEY_FILE). Создай: openflux-ctl key new"
+    case "$url" in
+        http://* | https://*) ;;
+        *) warn "Ссылка '$url' не начинается с http(s):// — проверь, что скопировал её целиком." ;;
+    esac
+
+    mkdir -p "$SECRETS"
+    chmod 700 "$SECRETS"
+    printf '%s' "$url" > "$SECRETS/$name.url"
+    chmod 600 "$SECRETS/$name.url"
+
+    local args="--role=exit --transport=$transport --url=\"\$(cat $SECRETS/$name.url)\" --encryption-key-file=$KEY_FILE"
+    [ -n "$extra" ] && args="$args $extra"
+    write_unit "$name" "OpenFlux exit node ($name / $transport)" "$args"
+
+    systemctl daemon-reload
+    systemctl enable --now "$(svc "$name")" > /dev/null 2>&1
+    sleep 3
+    local st
+    st=$(systemctl is-active "$(svc "$name")" 2>/dev/null || true)
+    if [ "$st" = "active" ]; then
+        ok "Нода '$name' ($transport) создана и запущена."
+    else
+        warn "Нода '$name' создана, но состояние: $(human_state "$st"). Смотри причину: openflux-ctl logs $name"
+    fi
+}
+
+# ---------------------------------------------------------------- set-url
+cmd_set_url() {
+    need_root
+    [ $# -eq 2 ] || die "Использование: openflux-ctl set-url <имя> <новая ссылка>"
+    exists "$1" || die "Нет ноды '$1'. Список: openflux-ctl list"
+    [ "$1" != "session" ] || die "У session нет своей ссылки: она берёт ссылки из одиночных нод. Меняй ссылку нужной ноды."
+    printf '%s' "$2" > "$SECRETS/$1.url"
+    chmod 600 "$SECRETS/$1.url"
+    systemctl restart "$(svc "$1")"
+    ok "Ссылка для '$1' обновлена, нода перезапущена."
+    [ -f "$(unit_path session)" ] && warn "Есть session-нода — перезапусти и её: openflux-ctl restart session"
+}
+
+# ---------------------------------------------------------------- remove
+cmd_remove() {
+    need_root
+    [ $# -ge 1 ] || die "Использование: openflux-ctl remove <имя> [-y]"
+    local n="$1"
+    exists "$n" || die "Нет ноды '$n'. Список: openflux-ctl list"
+    if [ "${2:-}" != "-y" ]; then
+        confirm "Удалить ноду '$n' (сервис и файл со ссылкой)?" || { echo "Отменено."; exit 0; }
+    fi
+    systemctl disable --now "$(svc "$n")" > /dev/null 2>&1
+    rm -f "$(unit_path "$n")" "$SECRETS/$n.url"
+    systemctl daemon-reload
+    systemctl reset-failed "$(svc "$n")" > /dev/null 2>&1
+    ok "Нода '$n' удалена."
+}
+
+# ---------------------------------------------------------------- session
+cmd_session() {
+    need_root
+    local names=() n t tlist="" urlflags="" w=100 seen=" "
+    if [ $# -gt 0 ]; then
+        names=("$@")
+    else
+        for t in boards vyandex yandex mailru cupsonline; do
+            exists "$t" && names+=("$t")
+        done
+    fi
+    [ "${#names[@]}" -ge 2 ] || die "Для session нужно минимум 2 одиночные ноды с разными транспортами.
+   Сначала добавь их (openflux-ctl add ...), потом: openflux-ctl session [имя1 имя2 ...]
+   Порядок имён = приоритет (первый — самый главный)."
+    exists session && die "session уже есть. Пересоздать: openflux-ctl remove session -y  и снова openflux-ctl session"
+    [ -x "$BIN" ] || die "Не найден бинарник $BIN"
+    [ -s "$KEY_FILE" ] || die "Нет ключа шифрования ($KEY_FILE)"
+
+    for n in "${names[@]}"; do
+        exists "$n" || die "Нода '$n' не найдена."
+        t=$(transport_of "$n")
+        [ -n "$t" ] || die "'$n' — не одиночная нода, её нельзя включить в session."
+        case "$seen" in *" $t "*) die "Транспорт '$t' указан дважды: в session каждый транспорт — один раз." ;; esac
+        seen="$seen$t "
+        tlist="$tlist${tlist:+,}$t:$w"
+        urlflags="$urlflags --$t-url=\"\$(cat $SECRETS/$n.url)\""
+        w=$((w - 20))
+        [ "$w" -lt 10 ] && w=10
+    done
+
+    local args="--role=exit --mode=l3 --negotiate --transports=$tlist --encryption-key-file=$KEY_FILE$urlflags --share"
+    write_unit session "OpenFlux session node ($tlist)" "$args"
+    systemctl daemon-reload
+    systemctl enable --now "$(svc session)" > /dev/null 2>&1
+    sleep 3
+    ok "session создан: транспорты $tlist"
+    warn "Если те же ссылки ещё используют одиночные ноды, два узла на одном документе могут мешать друг другу."
+    echo "     Если так — оставь только session:  openflux-ctl disable <имя>  и  openflux-ctl stop <имя>"
+    echo "     Ссылку для клиентов покажет: openflux-ctl link  (подожди пару секунд после запуска)"
+}
+
+cmd_link() {
+    need_root
+    exists session || die "Нет session-ноды. Создай: openflux-ctl session"
+    local link
+    link=$(journalctl -u "$(svc session)" --no-pager -n 500 2> /dev/null | grep -o 'openflux://[^[:space:]]*' | tail -1)
+    [ -n "$link" ] || die "Ссылка пока не найдена в логах. Подожди 10 секунд и повтори, либо смотри: openflux-ctl logs session"
+    echo "$link"
+    warn "Эта ссылка содержит ключ шифрования. Никому её не показывай и не публикуй."
+}
+
+# ---------------------------------------------------------------- list / status / logs
+cmd_list() {
+    local names n t en ac
+    names=$(all_names)
+    if [ -z "$names" ]; then
+        echo "Нод пока нет. Добавь первую:  openflux-ctl add yandex <ссылка>"
+        return 0
+    fi
+    printf '%-16s %-12s %-11s %s\n' "ИМЯ" "ТРАНСПОРТ" "АВТОЗАПУСК" "СОСТОЯНИЕ"
+    for n in $names; do
+        t=$(transport_of "$n")
+        [ -n "$t" ] || t="negotiate"
+        en=$(systemctl is-enabled "$(svc "$n")" 2> /dev/null || true)
+        ac=$(systemctl is-active "$(svc "$n")" 2> /dev/null || true)
+        printf '%-16s %-12s %-11s %s\n' "$n" "$t" "${en:-?}" "$(human_state "$ac")"
+    done
+}
+
+cmd_status() {
+    [ $# -ge 1 ] || die "Использование: openflux-ctl status <имя>"
+    exists "$1" || die "Нет ноды '$1'."
+    systemctl status "$(svc "$1")" --no-pager -n 15
+}
+
+cmd_logs() {
+    [ $# -ge 1 ] || die "Использование: openflux-ctl logs <имя> [-f]   (-f = следить в реальном времени, выход Ctrl+C)"
+    exists "$1" || die "Нет ноды '$1'."
+    if [ "${2:-}" = "-f" ]; then
+        journalctl -u "$(svc "$1")" -f
+    else
+        journalctl -u "$(svc "$1")" -n 60 --no-pager
+    fi
+}
+
+# ---------------------------------------------------------------- start / stop / restart / enable / disable
+cmd_action() {
+    need_root
+    local action="$1" targets n
+    shift
+    if [ $# -eq 0 ] || [ "$1" = "all" ]; then
+        targets=$(all_names)
+    else
+        targets="$*"
+    fi
+    [ -n "$targets" ] || die "Нод нет."
+    for n in $targets; do
+        if ! exists "$n"; then
+            warn "нет такой ноды: $n"
+            continue
+        fi
+        if systemctl "$action" "$(svc "$n")" > /dev/null 2>&1; then
+            ok "$action: $n"
+        else
+            bad "не удалось ($action): $n — смотри: openflux-ctl logs $n"
+        fi
+    done
+}
+
+cmd_debug() {
+    need_root
+    local n="${1:-}" mode="${2:-}" f
+    { [ -n "$n" ] && exists "$n"; } || die "Использование: openflux-ctl debug <имя> on|off"
+    f=$(unit_path "$n")
+    case "$mode" in
+        on)
+            grep -q -- ' --debug' "$f" || sed -i "/^ExecStart=/ s/'\$/ --debug'/" "$f"
+            warn "Режим debug пишет строку лога на КАЖДЫЙ пакет и быстро забивает диск. Включай ненадолго, потом: openflux-ctl debug $n off"
+            ;;
+        off) sed -i "/^ExecStart=/ s/ --debug'\$/'/" "$f" ;;
+        *) die "Использование: openflux-ctl debug <имя> on|off" ;;
+    esac
+    systemctl daemon-reload
+    systemctl restart "$(svc "$n")"
+    ok "debug $mode для '$n', нода перезапущена."
+}
+
+# ---------------------------------------------------------------- deploy / auto
+cmd_deploy() {
+    need_root
+    exec /usr/local/bin/openflux-deploy "$@"
+}
+
+cmd_auto() {
+    need_root
+    local mode="${1:-status}" min="${2:-10}"
+    case "$mode" in
+        on)
+            [[ "$min" =~ ^[0-9]+$ ]] && [ "$min" -ge 1 ] && [ "$min" -le 59 ] || die "Интервал — число минут от 1 до 59."
+            cat > "$CRON_FILE" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+*/$min * * * * root /usr/local/bin/openflux-deploy >> /var/log/openflux-deploy.log 2>&1
+EOF
+            chmod 644 "$CRON_FILE"
+            ok "Автообновление включено: проверка GitHub каждые $min мин."
+            ;;
+        off)
+            rm -f "$CRON_FILE"
+            ok "Автообновление выключено. Обновлять вручную: openflux-ctl deploy"
+            ;;
+        status)
+            if [ -f "$CRON_FILE" ]; then
+                ok "Автообновление включено:"
+                grep -v '^#' "$CRON_FILE" | grep 'openflux-deploy'
+            else
+                warn "Автообновление выключено. Включить: openflux-ctl auto on 10"
+            fi
+            echo "Последние записи журнала деплоя:"
+            tail -n 8 /var/log/openflux-deploy.log 2> /dev/null || echo "  (журнал пока пуст)"
+            ;;
+        *) die "Использование: openflux-ctl auto on [минуты] | off | status" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- key
+cmd_key() {
+    need_root
+    case "${1:-show}" in
+        show)
+            [ -s "$KEY_FILE" ] || die "Ключа нет. Создай: openflux-ctl key new"
+            cat "$KEY_FILE"
+            echo
+            ;;
+        new)
+            echo "Новый ключ заменит старый. Все клиенты перестанут подключаться, пока не получат новый ключ."
+            confirm "Точно создать новый ключ?" || { echo "Отменено."; exit 0; }
+            mkdir -p "$SECRETS"
+            chmod 700 "$SECRETS"
+            head -c 256 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 44 > "$KEY_FILE"
+            chmod 600 "$KEY_FILE"
+            ok "Новый ключ создан:"
+            cat "$KEY_FILE"
+            echo
+            [ -n "$(all_names)" ] && cmd_action restart all
+            ;;
+        *) die "Использование: openflux-ctl key [show|new]" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- check
+cmd_check() {
+    need_root
+    local G="" R="" Y="" B="" N=""
+    PROBS=0
+    WARNS=0
+    {
+        echo "OpenFlux — проверка состояния, $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "================================================"
+
+        echo; echo "--- Код и сборка ---"
+        if [ -d "$REPO_DIR/.git" ]; then
+            local cur built remote
+            cur=$(git -C "$REPO_DIR" rev-parse --short HEAD 2> /dev/null)
+            git -C "$REPO_DIR" fetch --quiet origin main 2> /dev/null
+            remote=$(git -C "$REPO_DIR" rev-parse --short origin/main 2> /dev/null)
+            built=$(cut -c1-7 "$REPO_DIR/.built-commit" 2> /dev/null)
+            echo "Код на сервере: $cur, собрана версия: ${built:-неизвестно}, на GitHub: ${remote:-?}"
+            if [ -n "$remote" ] && [ "$built" = "$remote" ]; then
+                ok "Установлена самая свежая версия."
+            else
+                warn "Есть более новая версия (или сборка не удалась). Обновить: openflux-ctl deploy"
+            fi
+        else
+            bad "Нет репозитория $REPO_DIR. Запусти установщик заново."
+        fi
+        if [ -x "$BIN" ]; then ok "Бинарник на месте."; else bad "Нет бинарника $BIN. Запусти: openflux-ctl deploy --force"; fi
+
+        echo; echo "--- Секреты ---"
+        if [ -s "$KEY_FILE" ]; then ok "Ключ шифрования на месте."; else bad "Нет ключа шифрования ($KEY_FILE)."; fi
+
+        echo; echo "--- Ноды ---"
+        local names n st t
+        names=$(all_names)
+        if [ -z "$names" ]; then
+            warn "Нод нет. Добавь: openflux-ctl add yandex <ссылка>"
+        fi
+        for n in $names; do
+            st=$(systemctl is-active "$(svc "$n")" 2> /dev/null || true)
+            t=$(transport_of "$n")
+            [ -n "$t" ] || t="negotiate"
+            case "$st" in
+                active) ok "$n ($t): работает" ;;
+                activating) bad "$n ($t): постоянно перезапускается — смотри: openflux-ctl logs $n" ;;
+                *) bad "$n ($t): $(human_state "$st") — смотри: openflux-ctl logs $n" ;;
+            esac
+            if [ "$n" != "session" ] && [ ! -s "$SECRETS/$n.url" ]; then
+                bad "$n: файл со ссылкой пуст или отсутствует ($SECRETS/$n.url)"
+            fi
+        done
+
+        echo; echo "--- Сетевое правило (сброс исходящих RST) ---"
+        if iptables -C OUTPUT -p tcp --tcp-flags RST RST -j DROP 2> /dev/null; then
+            ok "iptables: правило есть."
+        else
+            bad "iptables: правила нет. Применить: systemctl restart $FW_UNIT"
+        fi
+        if command -v iptables-legacy > /dev/null 2>&1 && iptables-legacy -L -n > /dev/null 2>&1; then
+            if iptables-legacy -C OUTPUT -p tcp --tcp-flags RST RST -j DROP 2> /dev/null; then
+                ok "iptables-legacy: правило есть."
+            else
+                warn "iptables-legacy: правила нет. Применить: systemctl restart $FW_UNIT"
+            fi
+        fi
+
+        echo; echo "--- Автообновление ---"
+        if [ -f "$CRON_FILE" ]; then ok "Включено: $(grep 'openflux-deploy' "$CRON_FILE" | awk '{print $1, $2, $3, $4, $5}')"; else warn "Выключено. Включить: openflux-ctl auto on 10"; fi
+        echo "Последние записи деплоя:"
+        tail -n 5 /var/log/openflux-deploy.log 2> /dev/null || echo "  (пока пусто)"
+
+        echo; echo "--- Сервер ---"
+        local pct sys_mb
+        pct=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+        if [ "${pct:-0}" -ge 90 ]; then bad "Диск заполнен на ${pct}% !"; elif [ "${pct:-0}" -ge 80 ]; then warn "Диск заполнен на ${pct}%"; else ok "Диск: занято ${pct}%"; fi
+        sys_mb=$(($(stat -c%s /var/log/syslog 2> /dev/null || echo 0) / 1048576))
+        if [ "$sys_mb" -ge 500 ]; then bad "/var/log/syslog весит ${sys_mb} МБ — обнули: truncate -s 0 /var/log/syslog"; else ok "syslog: ${sys_mb} МБ"; fi
+        echo "Журнал systemd: $(journalctl --disk-usage 2> /dev/null | grep -o '[0-9.]*[MGK]' | tail -1)"
+        local wa
+        wa=$(top -bn2 -d1 2> /dev/null | grep -i '^%Cpu' | tail -1 | tr ',' '.' | sed -n 's/.* \([0-9.]*\) wa.*/\1/p')
+        if [ -n "$wa" ]; then
+            if awk "BEGIN{exit !($wa >= 30)}"; then bad "Ожидание диска (iowait) ${wa}% — диск не справляется. Проверь: не включён ли debug, не разросся ли syslog."; else ok "iowait: ${wa}%"; fi
+        fi
+        echo "Память (МБ, доступно): $(free -m | awk '/^Mem:/{print $7}')"
+        echo "Нагрузка: $(cut -d' ' -f1-3 /proc/loadavg)"
+        echo "Внешний IP: $(curl -fsS --max-time 5 https://ifconfig.me/ip 2> /dev/null || echo 'не удалось определить')"
+    } > "$REPORT" 2>&1
+    echo "Отчёт сохранён: $REPORT"
+    echo "Проблем: $PROBS, предупреждений: $WARNS"
+    echo "Прочитать: cat $REPORT   (или: less $REPORT, выход — q)"
+    [ "$PROBS" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- firewall
+cmd_firewall() {
+    need_root
+    systemctl restart "$FW_UNIT" && ok "Правило применено."
+    iptables -S OUTPUT 2> /dev/null | grep RST || warn "В iptables правила не видно."
+}
+
+# ---------------------------------------------------------------- uninstall
+cmd_uninstall() {
+    need_root
+    local purge=0 n
+    [ "${1:-}" = "--purge" ] && purge=1
+    echo "Будет удалено: все ноды, правило iptables, автообновление, команды openflux-ctl / openflux-deploy."
+    if [ "$purge" -eq 1 ]; then
+        echo "Также БУДУТ УДАЛЕНЫ код ($REPO_DIR) и секреты ($SECRETS), включая ключ шифрования!"
+    else
+        echo "Код ($REPO_DIR) и секреты ($SECRETS) останутся. Стереть и их: openflux-ctl uninstall --purge"
+    fi
+    confirm "Продолжить?" || { echo "Отменено."; exit 0; }
+    for n in $(all_names); do
+        systemctl disable --now "$(svc "$n")" > /dev/null 2>&1
+        rm -f "$(unit_path "$n")"
+    done
+    systemctl disable --now "$FW_UNIT" > /dev/null 2>&1
+    rm -f "$UNIT_DIR/$FW_UNIT" /usr/local/sbin/openflux-firewall "$CRON_FILE" /etc/logrotate.d/openflux-deploy \
+        /etc/systemd/journald.conf.d/openflux.conf /usr/local/bin/openflux-deploy
+    systemctl daemon-reload
+    [ "$purge" -eq 1 ] && rm -rf "$REPO_DIR" "$SECRETS"
+    ok "OpenFlux удалён."
+    rm -f /usr/local/bin/openflux-ctl
+}
+
+# ---------------------------------------------------------------- help
+cmd_help() {
+    cat <<EOF
+${B}openflux-ctl${N} — управление нодой OpenFlux
+
+${B}Ноды${N}
+  list                          список нод и их состояние
+  add <транспорт> <ссылка> [имя] [-- флаги]   добавить ноду ($TRANSPORTS)
+  set-url <имя> <ссылка>        сменить ссылку у ноды
+  remove <имя> [-y]             удалить ноду
+  status <имя>                  подробный статус
+  logs <имя> [-f]               логи (-f = в реальном времени)
+  start | stop | restart [имя|all]      запустить / остановить / перезапустить
+  enable | disable [имя|all]    включить / выключить автозапуск (выключенные не трогает автообновление)
+  debug <имя> on|off            подробный лог (ненадолго! забивает диск)
+
+${B}Режим session (несколько транспортов в одной ноде)${N}
+  session [имя1 имя2 ...]       создать (порядок = приоритет; без имён — все одиночные)
+  link                          показать ссылку/ключ для клиентов (секретно!)
+
+${B}Обновления${N}
+  deploy [--force]              подтянуть код с GitHub, пересобрать, перезапустить ноды
+  auto on [минуты] | off | status   автопроверка обновлений (по умолчанию каждые 10 минут)
+
+${B}Прочее${N}
+  check                         полная проверка, отчёт в $REPORT
+  key [show|new]                показать / заменить ключ шифрования
+  firewall                      заново применить правило iptables
+  uninstall [--purge]           удалить всё
+EOF
+}
+
+case "${1:-help}" in
+    list | ls) cmd_list ;;
+    add) shift; cmd_add "$@" ;;
+    set-url) shift; cmd_set_url "$@" ;;
+    remove | rm) shift; cmd_remove "$@" ;;
+    session) shift; cmd_session "$@" ;;
+    link) cmd_link ;;
+    status) shift; cmd_status "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    start | stop | restart | enable | disable) a="$1"; shift; cmd_action "$a" "$@" ;;
+    debug) shift; cmd_debug "$@" ;;
+    deploy) shift; cmd_deploy "$@" ;;
+    auto) shift; cmd_auto "$@" ;;
+    key) shift; cmd_key "$@" ;;
+    check) cmd_check ;;
+    firewall) cmd_firewall ;;
+    uninstall) shift; cmd_uninstall "$@" ;;
+    help | -h | --help) cmd_help ;;
+    *) echo "Неизвестная команда: $1"; echo; cmd_help; exit 1 ;;
+esac

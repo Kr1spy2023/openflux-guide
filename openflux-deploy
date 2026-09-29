@@ -1,0 +1,72 @@
+#!/bin/bash
+# openflux-deploy — тянет код с GitHub, пересобирает, перезапускает включённые ноды.
+# Вызывается вручную (openflux-ctl deploy) и по крону (openflux-ctl auto on).
+set -u
+export PATH="$PATH:/snap/bin:/usr/local/go/bin"
+
+REPO_DIR="/root/openflux"
+REPO_URL="https://github.com/p1neappleXpress/OpenFlux.git"
+BRANCH="main"
+BUILT_FILE="$REPO_DIR/.built-commit"
+PREFIX="openflux-"
+LOG_PREFIX="[deploy $(date '+%Y-%m-%d %H:%M:%S')]"
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+log() { echo "$LOG_PREFIX $*"; }
+
+if [ ! -d "$REPO_DIR/.git" ]; then
+    log "репозиторий не найден, клонирую заново..."
+    git clone --quiet "$REPO_URL" "$REPO_DIR" || { log "ОШИБКА: не удалось склонировать репозиторий"; exit 1; }
+fi
+
+cd "$REPO_DIR" || { log "ОШИБКА: нет доступа к $REPO_DIR"; exit 1; }
+
+log "проверяю GitHub..."
+if ! git fetch --quiet origin "$BRANCH"; then
+    log "ОШИБКА: не удалось подключиться к GitHub (сеть?)"
+    exit 1
+fi
+
+REMOTE=$(git rev-parse "origin/$BRANCH")
+BUILT=$(cat "$BUILT_FILE" 2> /dev/null || echo "")
+
+if [ "$FORCE" -eq 0 ] && [ "$BUILT" = "$REMOTE" ]; then
+    log "новых коммитов нет, пропускаю"
+    exit 0
+fi
+
+log "новая версия: $REMOTE"
+if ! git checkout --quiet --force "$BRANCH" || ! git reset --quiet --hard "origin/$BRANCH"; then
+    log "ОШИБКА: git checkout/reset не удался"
+    exit 1
+fi
+
+log "собираю (go build)..."
+if ! go build -o openflux . 2>&1 | sed "s/^/$LOG_PREFIX   /"; then
+    log "ОШИБКА СБОРКИ — старый бинарник и все ноды остаются без изменений, ничего не рестартую"
+    exit 1
+fi
+chmod +x openflux
+echo "$REMOTE" > "$BUILT_FILE"
+log "сборка готова, версия $(git rev-parse --short HEAD)"
+
+SERVICES=$(systemctl list-unit-files --no-legend --state=enabled "${PREFIX}*.service" 2> /dev/null | awk '{print $1}')
+
+if [ -z "$SERVICES" ]; then
+    log "нет включённых нод ($PREFIX*), перезапускать нечего"
+    exit 0
+fi
+
+systemctl daemon-reload
+
+for svc in $SERVICES; do
+    log "перезапуск $svc ..."
+    if systemctl restart "$svc"; then
+        log "  -> ок"
+    else
+        log "  -> ОШИБКА, смотри: journalctl -u $svc -n 50"
+    fi
+done
+
+log "готово"
