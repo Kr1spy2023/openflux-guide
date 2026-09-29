@@ -40,28 +40,54 @@
 
 **1. Зайди на сервер по SSH.**
 
-**2. Скачай эти три файла на сервер** — любым способом: `scp`, копипастой через `nano`, или так, если файлы лежат в репозитории:
+**2. Скачай файлы прямо из репозитория** — двумя способами, любой подойдёт.
+
+Способ А, через `git clone` (проще, сразу все файлы разом):
+
+```bash
+cd /root
+git clone https://github.com/Kr1spy2023/openflux-guide.git
+cd openflux-guide
+```
+
+Способ Б, через `curl`, по одному файлу (если `git` ещё не поставлен и ставить его не хочется):
 
 ```bash
 mkdir -p /root/openflux-install && cd /root/openflux-install
-curl -O https://example.com/путь/до/setup.sh
-curl -O https://example.com/путь/до/openflux-ctl
-curl -O https://example.com/путь/до/openflux-deploy
+curl -O https://raw.githubusercontent.com/Kr1spy2023/openflux-guide/main/setup.sh
+curl -O https://raw.githubusercontent.com/Kr1spy2023/openflux-guide/main/openflux-ctl
+curl -O https://raw.githubusercontent.com/Kr1spy2023/openflux-guide/main/openflux-deploy
 ```
 
-Если файлов на сайте нет — просто создай их вручную:
+Проверь, что файлы скачались правильно (не страница с ошибкой):
+
+```bash
+head -3 setup.sh
+```
+
+Должно быть:
+```
+#!/bin/bash
+# setup.sh — ставит OpenFlux с нуля...
+```
+
+Если видишь что-то вроде `404: Not Found` — значит файла по этому пути в репозитории нет (проверь, что он реально загружен в ветку `main` в корень репозитория), либо ветка называется иначе (`master`) — тогда замени `main` на `master` в ссылках выше.
+
+Если ни `git`, ни доступа к репозиторию нет — можно создать файлы и вручную:
 
 ```bash
 mkdir -p /root/openflux-install && cd /root/openflux-install
 nano setup.sh
 ```
 
-Вставь содержимое файла `setup.sh` (правой кнопкой мыши → вставить, либо `Ctrl+Shift+V` в большинстве терминалов), сохрани: `Ctrl+O`, `Enter`, `Ctrl+X`. Повтори то же самое для `openflux-ctl` и `openflux-deploy`.
+Вставь содержимое файла (скопировав его откуда угодно, где он у тебя есть), сохрани: `Ctrl+O`, `Enter`, `Ctrl+X`. Повтори для `openflux-ctl` и `openflux-deploy`.
 
 **3. Запусти установку:**
 
 ```bash
-cd /root/openflux-install
+cd /root/openflux-guide   # если качал через git clone
+# или
+cd /root/openflux-install # если качал через curl
 sudo bash setup.sh
 ```
 
