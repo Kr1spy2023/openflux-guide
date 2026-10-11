@@ -26,18 +26,62 @@ fi
 go version
 
 echo "== 3/8: код проекта =="
+
+# Функция определения и переключения на самую свежую ветку
+sync_to_latest_branch() {
+    cd "$REPO_DIR"
+    echo "Проверяю ветки на GitHub (main vs release/X.Y.Z)..."
+
+    # 1. Ищем последнюю релизную ветку release/X.Y.Z
+    set +e
+    local rel_out latest_rel
+    rel_out=$(git ls-remote --heads "$REPO_URL" 'refs/heads/release/*' 2>/dev/null | grep -E 'refs/heads/release/[0-9]+\.[0-9]+\.[0-9]+$')
+    if [ -n "$rel_out" ]; then
+        latest_rel=$(echo "$rel_out" | awk -F'refs/heads/' '{print $2}' | sort -V | tail -n 1)
+    else
+        latest_rel=""
+    fi
+    set -e
+
+    # 2. Фетчим main и получаем время последнего коммита
+    git fetch --quiet origin main
+    local main_time release_time target_branch="main"
+    main_time=$(git log -1 --format=%ct origin/main 2>/dev/null || echo 0)
+
+    # 3. Сравниваем время коммита main и релизной ветки
+    if [ -n "$latest_rel" ]; then
+        if git fetch --quiet origin "$latest_rel" 2>/dev/null; then
+            release_time=$(git log -1 --format=%ct "origin/$latest_rel" 2>/dev/null || echo 0)
+            if [ "$release_time" -gt "$main_time" ]; then
+                target_branch="$latest_rel"
+                echo "Найдена более свежая релизная ветка: $target_branch"
+            else
+                echo "Ветка main свежее ($latest_rel устарела). Выбираем main."
+            fi
+        fi
+    fi
+
+    echo "Переключаюсь на ветку: $target_branch"
+    git checkout --quiet --force "$target_branch" 2>/dev/null || git checkout --quiet -B "$target_branch" "origin/$target_branch"
+    git reset --quiet --hard "origin/$target_branch"
+}
+
 if [ -d "$REPO_DIR/.git" ]; then
-    echo "Репозиторий уже есть, обновляю..."
-    git -C "$REPO_DIR" fetch --quiet origin main
-    git -C "$REPO_DIR" checkout --quiet --force main
-    git -C "$REPO_DIR" reset --quiet --hard origin/main
+    echo "Репозиторий уже существует. Проверяю и обновляю до последней версии..."
+    sync_to_latest_branch
 else
+    echo "Репозиторий не найден. Клонирую заново..."
     git clone --quiet "$REPO_URL" "$REPO_DIR"
+    sync_to_latest_branch
 fi
+
+# Сборка бинарника
 cd "$REPO_DIR"
+echo "Собираю (go build)..."
 go build -o openflux .
 chmod +x openflux
 git rev-parse HEAD > "$REPO_DIR/.built-commit"
+echo "Успешно собрана версия $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 
 echo "== 4/8: папка секретов =="
 mkdir -p "$SECRETS"
