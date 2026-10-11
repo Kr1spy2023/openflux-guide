@@ -105,7 +105,7 @@ cmd_add() {
     fi
 
     case "$transport" in
-        yandex | vyandex | boards | mailru | cupsonline) ;;
+        yandex | vyandex | boards | mailru | cupsonline | telemost) ;;
         oneme) die "Транспорт oneme требует токен и в этой команде не поддерживается (см. README, «Продвинутое»)." ;;
         *) die "Неизвестный транспорт '$transport'. Доступны: $TRANSPORTS" ;;
     esac
@@ -371,16 +371,42 @@ cmd_check() {
 
         echo; echo "--- Код и сборка ---"
         if [ -d "$REPO_DIR/.git" ]; then
-            local cur built remote
+            local cur built remote target_branch latest_rel rel_out main_time rel_time REPO_URL_VAL
             cur=$(git -C "$REPO_DIR" rev-parse --short HEAD 2> /dev/null)
-            git -C "$REPO_DIR" fetch --quiet origin main 2> /dev/null
-            remote=$(git -C "$REPO_DIR" rev-parse --short origin/main 2> /dev/null)
             built=$(cut -c1-7 "$REPO_DIR/.built-commit" 2> /dev/null)
-            echo "Код на сервере: $cur, собрана версия: ${built:-неизвестно}, на GitHub: ${remote:-?}"
-            if [ -n "$remote" ] && [ "$built" = "$remote" ]; then
-                ok "Установлена самая свежая версия."
+            REPO_URL_VAL=$(git -C "$REPO_DIR" config --get remote.origin.url 2>/dev/null || echo "${REPO_URL:-}")
+
+            # Запрашиваем релизные ветки
+            set +u
+            rel_out=$(git ls-remote --heads "$REPO_URL_VAL" 'refs/heads/release/*' 2>/dev/null | grep -E 'refs/heads/release/[0-9]+\.[0-9]+\.[0-9]+$')
+            if [ -n "$rel_out" ]; then
+                latest_rel=$(echo "$rel_out" | awk -F'refs/heads/' '{print $2}' | sort -V | tail -n 1)
             else
-                warn "Есть более новая версия (или сборка не удалась). Обновить: openflux-ctl deploy"
+                latest_rel=""
+            fi
+            set -u
+
+            # Получаем коммит в main
+            git -C "$REPO_DIR" fetch --quiet origin main 2>/dev/null
+            main_time=$(git -C "$REPO_DIR" log -1 --format=%ct origin/main 2>/dev/null || echo 0)
+
+            target_branch="main"
+            if [ -n "$latest_rel" ]; then
+                if git -C "$REPO_DIR" fetch --quiet origin "$latest_rel" 2>/dev/null; then
+                    rel_time=$(git -C "$REPO_DIR" log -1 --format=%ct "origin/$latest_rel" 2>/dev/null || echo 0)
+                    if [ "$rel_time" -gt "$main_time" ]; then
+                        target_branch="$latest_rel"
+                    fi
+                fi
+            fi
+
+            remote=$(git -C "$REPO_DIR" rev-parse --short "origin/$target_branch" 2> /dev/null)
+
+            echo "Код на сервере: $cur, собрана версия: ${built:-неизвестно}, на GitHub ($target_branch): ${remote:-?}"
+            if [ -n "$remote" ] && [ "$built" = "$remote" ]; then
+                ok "Установлена самая свежая версия ($target_branch)."
+            else
+                warn "Есть более новая версия ($target_branch). Обновить: openflux-ctl deploy"
             fi
         else
             bad "Нет репозитория $REPO_DIR. Запусти установщик заново."
