@@ -11,7 +11,7 @@ PREFIX="openflux-"
 FW_UNIT="firewall-openflux.service"
 CRON_FILE="/etc/cron.d/openflux-deploy"
 REPORT="/root/openflux-checklist.txt"
-TRANSPORTS="yandex vyandex boards mailru cupsonline"
+TRANSPORTS="yandex vyandex boards mailru cupsonline telemost"
 PROBS=0
 WARNS=0
 
