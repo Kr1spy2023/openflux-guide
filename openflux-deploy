@@ -6,7 +6,6 @@ export PATH="$PATH:/snap/bin:/usr/local/go/bin"
 
 REPO_DIR="/root/openflux"
 REPO_URL="https://github.com/p1neappleXpress/OpenFlux.git"
-BRANCH="main"
 BUILT_FILE="$REPO_DIR/.built-commit"
 PREFIX="openflux-"
 LOG_PREFIX="[deploy $(date '+%Y-%m-%d %H:%M:%S')]"
@@ -22,34 +21,76 @@ fi
 
 cd "$REPO_DIR" || { log "ОШИБКА: нет доступа к $REPO_DIR"; exit 1; }
 
-log "проверяю GitHub..."
-if ! git fetch --quiet origin "$BRANCH"; then
-    log "ОШИБКА: не удалось подключиться к GitHub (сеть?)"
+log "проверяю GitHub и сравниваю ветки (main vs release/X.Y.Z)..."
+
+# Временно отключаем nounset для защиты от пустых переменных
+set +u
+
+# 1. Ищем самую свежую версию ветки release/X.Y.Z
+REMOTE_OUT=$(git ls-remote --heads "$REPO_URL" 'refs/heads/release/*' 2>/dev/null | grep -E 'refs/heads/release/[0-9]+\.[0-9]+\.[0-9]+$')
+
+if [ -n "$REMOTE_OUT" ]; then
+    LATEST_RELEASE_BRANCH=$(echo "$REMOTE_OUT" | awk -F'refs/heads/' '{print $2}' | sort -V | tail -n 1)
+else
+    LATEST_RELEASE_BRANCH=""
+fi
+
+set -u
+
+# 2. Подтягиваем обновления для main
+if ! git fetch --quiet origin main; then
+    log "ОШИБКА: не удалось скачать ветку main с GitHub"
     exit 1
+fi
+MAIN_TIME=$(git log -1 --format=%ct origin/main 2>/dev/null || echo 0)
+
+# 3. Определяем, какую ветку выбрать по дате коммита
+if [ -n "${LATEST_RELEASE_BRANCH:-}" ]; then
+    # Скачиваем релизную ветку для проверки её коммита
+    if git fetch --quiet origin "$LATEST_RELEASE_BRANCH"; then
+        RELEASE_TIME=$(git log -1 --format=%ct "origin/$LATEST_RELEASE_BRANCH" 2>/dev/null || echo 0)
+
+        # Сравниваем timestamp последних коммитов (в секундах)
+        if [ "$RELEASE_TIME" -gt "$MAIN_TIME" ]; then
+            BRANCH="$LATEST_RELEASE_BRANCH"
+            log "выбрана релизная ветка (коммит свежее): $BRANCH"
+        else
+            BRANCH="main"
+            log "выбрана ветка main (коммит свежее, чем в $LATEST_RELEASE_BRANCH)"
+        fi
+    else
+        BRANCH="main"
+        log "не удалось подтянуть $LATEST_RELEASE_BRANCH, fallback на main"
+    fi
+else
+    BRANCH="main"
+    log "релизные ветки X.Y.Z не найдены, использую ветку: $BRANCH"
 fi
 
 REMOTE=$(git rev-parse "origin/$BRANCH")
 BUILT=$(cat "$BUILT_FILE" 2> /dev/null || echo "")
 
 if [ "$FORCE" -eq 0 ] && [ "$BUILT" = "$REMOTE" ]; then
-    log "новых коммитов нет, пропускаю"
+    log "новых коммитов в $BRANCH нет, пропускаю"
     exit 0
 fi
 
-log "новая версия: $REMOTE"
-if ! git checkout --quiet --force "$BRANCH" || ! git reset --quiet --hard "origin/$BRANCH"; then
+log "новая версия ($BRANCH): $REMOTE"
+
+# Переключение/обновление ветки
+if ! git checkout --quiet --force "$BRANCH" 2>/dev/null || ! git checkout --quiet -B "$BRANCH" "origin/$BRANCH" || ! git reset --quiet --hard "origin/$BRANCH"; then
     log "ОШИБКА: git checkout/reset не удался"
     exit 1
 fi
 
 log "собираю (go build)..."
-if ! go build -o openflux . 2>&1 | sed "s/^/$LOG_PREFIX   /"; then
+if ! go build -o openflux . 2>&1 | sed "s/^/$LOG_PREFIX    /"; then
     log "ОШИБКА СБОРКИ — старый бинарник и все ноды остаются без изменений, ничего не рестартую"
     exit 1
 fi
 chmod +x openflux
 echo "$REMOTE" > "$BUILT_FILE"
-log "сборка готова, версия $(git rev-parse --short HEAD)"
+log "сборка готова, версия $(git rev-parse --short HEAD) ($BRANCH)"
 
 SERVICES=$(systemctl list-unit-files --no-legend --state=enabled "${PREFIX}*.service" 2> /dev/null | awk '{print $1}')
 
