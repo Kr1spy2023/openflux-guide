@@ -11,7 +11,7 @@ PREFIX="openflux-"
 FW_UNIT="firewall-openflux.service"
 CRON_FILE="/etc/cron.d/openflux-deploy"
 REPORT="/root/openflux-checklist.txt"
-TRANSPORTS="yandex vyandex boards mailru cupsonline telemost"
+TRANSPORTS="yandex vyandex boards mailru cupsonline telemost avito"
 PROBS=0
 WARNS=0
 
@@ -105,7 +105,7 @@ cmd_add() {
     fi
 
     case "$transport" in
-        yandex | vyandex | boards | mailru | cupsonline | telemost) ;;
+        yandex | vyandex | boards | mailru | cupsonline | telemost | avito) ;;
         oneme) die "Транспорт oneme требует токен и в этой команде не поддерживается (см. README, «Продвинутое»)." ;;
         *) die "Неизвестный транспорт '$transport'. Доступны: $TRANSPORTS" ;;
     esac
