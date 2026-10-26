@@ -209,6 +209,12 @@ openflux-ctl debug yandex off
 | `openflux-ctl auto off` | Выключить автопроверку |
 | `openflux-ctl auto status` | Посмотреть, включена ли автопроверка, и последние строки её журнала |
 
+> **У кого старая версия `openflux-ctl` (команды `update` ещё нет):** один раз обнови его вручную, дальше хватит `openflux-ctl update`:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/Kr1spy2023/openflux-guide/main/openflux-ctl -o /usr/local/bin/openflux-ctl && chmod +x /usr/local/bin/openflux-ctl
+> ```
+
 ### Ключ шифрования
 
 ```bash
