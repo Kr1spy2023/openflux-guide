@@ -3,6 +3,9 @@
 set -u
 
 REPO_DIR="/root/openflux"
+GUIDE_DIR="/root/openflux-guide"
+GUIDE_URL="https://github.com/Kr1spy2023/openflux-guide.git"
+GUIDE_BRANCH="main"
 BIN="$REPO_DIR/openflux"
 SECRETS="/root/openflux-secrets"
 KEY_FILE="$SECRETS/encryption-key"
@@ -316,6 +319,45 @@ cmd_debug() {
     ok "debug $mode для '$n', нода перезапущена."
 }
 
+# ---------------------------------------------------------------- update
+# Подтягивает openflux-guide с GitHub (ветка main) и обновляет скрипты в /usr/local/bin
+cmd_update() {
+    need_root
+    command -v git > /dev/null 2>&1 || die "Не найден git."
+    export PATH="$PATH:/snap/bin"
+
+    if [ -d "$GUIDE_DIR/.git" ]; then
+        git -C "$GUIDE_DIR" fetch --quiet origin "$GUIDE_BRANCH" || die "Не удалось получить обновления с GitHub."
+        git -C "$GUIDE_DIR" checkout --quiet -B "$GUIDE_BRANCH" "origin/$GUIDE_BRANCH" 2> /dev/null || true
+        git -C "$GUIDE_DIR" reset --quiet --hard "origin/$GUIDE_BRANCH"
+    else
+        rm -rf "$GUIDE_DIR"
+        git clone --quiet --branch "$GUIDE_BRANCH" "$GUIDE_URL" "$GUIDE_DIR" || die "Не удалось скачать $GUIDE_URL"
+    fi
+    ok "Репозиторий openflux-guide обновлён: $(git -C "$GUIDE_DIR" rev-parse --short HEAD)"
+
+    # Копии скриптов лежат в /usr/local/bin — обновляем их
+    install -m 755 "$GUIDE_DIR/openflux-deploy" /usr/local/bin/openflux-deploy
+    ok "openflux-deploy обновлён."
+
+    # Утилита для QR-кода
+    if command -v go > /dev/null 2>&1 && [ -f "$GUIDE_DIR/qr.go" ]; then
+        (
+            cd "$GUIDE_DIR" || exit 1
+            [ -f go.mod ] || go mod init openflux-guide > /dev/null 2>&1
+            go get github.com/skip2/go-qrcode@latest > /dev/null 2>&1
+            go build -o /usr/local/bin/openflux-guide-qr qr.go
+        ) && ok "openflux-guide-qr пересобран." || warn "Не удалось пересобрать openflux-guide-qr (QR-код может не работать)."
+    else
+        warn "Go или qr.go не найдены — QR-утилиту пропускаю."
+    fi
+
+    # Сам openflux-ctl обновляем последним и выходим: bash читает скрипт по ходу выполнения
+    install -m 755 "$GUIDE_DIR/openflux-ctl" /usr/local/bin/openflux-ctl
+    ok "openflux-ctl обновлён."
+    exit 0
+}
+
 # ---------------------------------------------------------------- deploy / auto
 cmd_deploy() {
     need_root
@@ -547,10 +589,12 @@ ${B}Ноды${N}
 
 ${B}Режим session (несколько транспортов в одной ноде)${N}
   session [имя1 имя2 ...]       создать (порядок = приоритет; без имён — все одиночные)
-  link                          показать ссылку/ключ для клиентов (секретно!)
+  link                          показать QR-код и ссылку/ключ для клиентов (секретно!)
+  qr <ссылка_или_текст>         нарисовать QR-код в терминале
 
 ${B}Обновления${N}
   deploy [--force]              подтянуть код с GitHub, пересобрать, перезапустить ноды
+  update                        подтянуть с GitHub сам openflux-ctl, openflux-deploy и QR-утилиту
   auto on [минуты] | off | status   автопроверка обновлений (по умолчанию каждые 10 минут)
 
 ${B}Прочее${N}
@@ -567,13 +611,14 @@ case "${1:-help}" in
     set-url) shift; cmd_set_url "$@" ;;
     remove | rm) shift; cmd_remove "$@" ;;
     session) shift; cmd_session "$@" ;;
-	qr) shift; cmd_qr "$@" ;;
+    qr) shift; cmd_qr "$@" ;;
     link) cmd_link ;;
     status) shift; cmd_status "$@" ;;
     logs) shift; cmd_logs "$@" ;;
     start | stop | restart | enable | disable) a="$1"; shift; cmd_action "$a" "$@" ;;
     debug) shift; cmd_debug "$@" ;;
     deploy) shift; cmd_deploy "$@" ;;
+    update) cmd_update ;;
     auto) shift; cmd_auto "$@" ;;
     key) shift; cmd_key "$@" ;;
     check) cmd_check ;;
