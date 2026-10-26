@@ -83,6 +83,32 @@ chmod +x openflux
 git rev-parse HEAD > "$REPO_DIR/.built-commit"
 echo "Успешно собрана версия $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 
+echo "== Компиляция вспомогательной утилиты openflux-guide-qr =="
+
+BUILD_DIR="/root/openflux-guide"
+
+if [ -d "$BUILD_DIR" ]; then
+    cd "$BUILD_DIR"
+
+    # Инициализируем go.mod, если его еще нет
+    if [ ! -f "go.mod" ]; then
+        go mod init openflux-guide
+    fi
+
+    # Загружаем библиотеку генерации QR
+    go get github.com/skip2/go-qrcode@latest
+
+    # Компилируем с сохранением под именем /usr/local/bin/openflux-guide-qr
+    echo "Компилирую утилиту openflux-guide-qr..."
+    go build -o /usr/local/bin/openflux-guide-qr qr.go
+    chmod +x /usr/local/bin/openflux-guide-qr
+
+    echo "Успешно скомпилировано в /usr/local/bin/openflux-guide-qr"
+else
+    echo "ОШИБКА: директория $BUILD_DIR не найдена!"
+    exit 1
+fi
+
 echo "== 4/8: папка секретов =="
 mkdir -p "$SECRETS"
 chmod 700 "$SECRETS"

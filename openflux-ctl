@@ -11,7 +11,7 @@ PREFIX="openflux-"
 FW_UNIT="firewall-openflux.service"
 CRON_FILE="/etc/cron.d/openflux-deploy"
 REPORT="/root/openflux-checklist.txt"
-TRANSPORTS="yandex vyandex boards mailru cupsonline telemost"
+TRANSPORTS="yandex vyandex boards mailru cupsonline telemost avito"
 PROBS=0
 WARNS=0
 
@@ -105,7 +105,7 @@ cmd_add() {
     fi
 
     case "$transport" in
-        yandex | vyandex | boards | mailru | cupsonline | telemost) ;;
+        yandex | vyandex | boards | mailru | cupsonline | telemost | avito) ;;
         oneme) die "Транспорт oneme требует токен и в этой команде не поддерживается (см. README, «Продвинутое»)." ;;
         *) die "Неизвестный транспорт '$transport'. Доступны: $TRANSPORTS" ;;
     esac
@@ -210,13 +210,33 @@ cmd_session() {
     echo "     Ссылку для клиентов покажет: openflux-ctl link  (подожди пару секунд после запуска)"
 }
 
+cmd_qr() {
+    [ $# -ge 1 ] || die "Использование: openflux-ctl qr <ссылка_или_текст>"
+    if [ -x "/usr/local/bin/openflux-guide-qr" ]; then
+        /usr/local/bin/openflux-guide-qr "$1"
+    elif command -v openflux-guide-qr > /dev/null 2>&1; then
+        openflux-guide-qr "$1"
+    else
+        die "Утилита /usr/local/bin/openflux-guide-qr не найдена."
+    fi
+}
+
 cmd_link() {
     need_root
     exists session || die "Нет session-ноды. Создай: openflux-ctl session"
+    
     local link
     link=$(journalctl -u "$(svc session)" --no-pager -n 500 2> /dev/null | grep -o 'openflux://[^[:space:]]*' | tail -1)
     [ -n "$link" ] || die "Ссылка пока не найдена в логах. Подожди 10 секунд и повтори, либо смотри: openflux-ctl logs session"
+
+    echo ""
+    echo "=== QR-код для подключения ==="
+    # Вызываем скомпилированный Go-бинарник с аргументом qr
+    /usr/local/bin/openflux-ctl qr "$link" 2>/dev/null || true
+    echo ""
+
     echo "$link"
+    echo ""
     warn "Эта ссылка содержит ключ шифрования. Никому её не показывай и не публикуй."
 }
 
@@ -547,6 +567,7 @@ case "${1:-help}" in
     set-url) shift; cmd_set_url "$@" ;;
     remove | rm) shift; cmd_remove "$@" ;;
     session) shift; cmd_session "$@" ;;
+	qr) shift; cmd_qr "$@" ;;
     link) cmd_link ;;
     status) shift; cmd_status "$@" ;;
     logs) shift; cmd_logs "$@" ;;
